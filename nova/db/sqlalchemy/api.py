@@ -1273,16 +1273,9 @@ def instance_get_all_by_filters(context, filters):
             return query.filter_by(**filter_dict)
 
     session = get_session()
-    query_prefix = session.query(models.Instance).\
-                   options(joinedload_all('fixed_ips.floating_ips')).\
-                   options(joinedload_all('virtual_interfaces.network')).\
-                   options(joinedload_all(
-                           'virtual_interfaces.fixed_ips.floating_ips')).\
-                   options(joinedload('virtual_interfaces.instance')).\
+    query = session.query(models.Instance).\
                    options(joinedload('security_groups')).\
-                   options(joinedload_all('fixed_ips.network')).\
                    options(joinedload('metadata')).\
-                   options(joinedload('instance_type')).\
                    order_by(desc(models.Instance.created_at))
 
     # Make a copy of the filters dictionary to use going forward, as we'll
@@ -1291,8 +1284,7 @@ def instance_get_all_by_filters(context, filters):
 
     if 'changes-since' in filters:
         changes_since = filters['changes-since']
-        query_prefix = query_prefix.\
-                            filter(models.Instance.updated_at > changes_since)
+        query = query.filter(models.Instance.updated_at > changes_since)
 
     if not context.is_admin:
         # If we're not admin context, add appropriate filter..
@@ -1312,10 +1304,39 @@ def instance_get_all_by_filters(context, filters):
     for filter_name in query_filters:
         # Do the matching and remove the filter from the dictionary
         # so we don't try it again below..
-        query_prefix = _exact_match_filter(query_prefix, filter_name,
+        query = _exact_match_filter(query, filter_name,
                 filters.pop(filter_name))
 
-    instances = query_prefix.all()
+    # Now we handle filters on IP address. If the address supplied
+    # is an entire IP address and not a regex, we can use the
+    # database joins and SARGs to do the filtering efficiently.
+    if 'ip' in filters.keys():
+        address = filters.pop('ip')
+        instance_ids = []
+        # Rather than get into a really convoluted subquery or multiple
+        # left outer join query, let's simply do a single query to
+        # get all the instance IDs that are tied to either a fixed IP
+        # address OR any floating IP address tied to a fixed IP address
+        # that matches the supplied IP address.
+        fixed_ips = session.query(models.FixedIp.instance_id).\
+                    filter(models.FixedIp.address == address).\
+                    filter(models.FixedIp.deleted == False).all()
+        if fixed_ips:
+            instance_ids += [row[0] for row in fixed_ips]
+
+        # We join("floating_ips") below instead of join(models.FloatingIp)
+        # because without that, the primaryjoin defined in the FloatingIp
+        # model that uses both fixed_ip_id AND deleted = False isn't used.
+        floating_ips = session.query(models.FixedIp.instance_id).\
+                    join("floating_ips").\
+                    filter(models.FloatingIp.address == address).\
+                    filter(models.FloatingIp.deleted == False).\
+                    distinct().all()
+        if floating_ips:
+            instance_ids += [row[0] for row in floating_ips]
+        query = query.filter(models.Instance.id.in_(instance_ids))
+
+    instances = query.all()
 
     if not instances:
         return []
@@ -1324,7 +1345,7 @@ def instance_get_all_by_filters(context, filters):
     # For filters not in the list, we'll attempt to use the filter_name
     # as a column name in Instance..
     regexp_filter_funcs = {'ip6': _regexp_filter_by_ipv6,
-            'ip': _regexp_filter_by_ip}
+            'ip_re': _regexp_filter_by_ip}
 
     for filter_name in filters.iterkeys():
         filter_func = regexp_filter_funcs.get(filter_name, None)
